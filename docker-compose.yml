@@ -1,0 +1,222 @@
+# version: '3.8'  # Version is obsolete in newer Docker Compose
+
+services:
+  # Message Queue
+  redis:
+    image: redis:7-alpine
+    container_name: bird-monitor-redis
+    volumes:
+      - redis-data:/data
+    networks:
+      - bird-monitor-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: bird-monitor-db
+    environment:
+      POSTGRES_DB: birdmonitor
+      POSTGRES_USER: birdmonitor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme265}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - bird-monitor-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U birdmonitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Capture Service (consumes RTSP stream)
+  capture-service:
+    build:
+      context: ./services/capture
+      dockerfile: Dockerfile
+    container_name: bird-monitor-capture
+    volumes:
+      - ./data/images:/app/data/images
+      - ./config:/app/config
+      - ./logs:/app/logs
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_QUEUE=images
+      # RTSP URL - on macOS Docker, use host.docker.internal
+      # On Linux, use host IP or hostname
+      - CAMERA_URL=${CAMERA_URL:-rtsp://host.docker.internal:8554/webcam}
+      - IMAGES_PATH=/app/data/images
+      - CAMERA_RESOLUTION=1920,1080
+      - CAMERA_FPS=15
+      - MOTION_THRESHOLD=50
+      - MOTION_MIN_AREA=3000
+      - MOTION_COOLDOWN=5.0
+      - MOTION_DELAY=0.5
+      - MOTION_MOG2_VAR_THRESHOLD=35
+      - MOTION_BINARY_THRESHOLD=175
+      - CAPTURE_HTTP_PORT=8080
+      - CAPTURE_HTTP_HOST=0.0.0.0
+    networks:
+      - bird-monitor-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "src/capture_service.py"]
+
+  # Detection Service (consumes images from Redis, runs YOLOv8 inference)
+  detection-service:
+    build:
+      context: ./services/detection
+      dockerfile: Dockerfile
+    container_name: bird-monitor-detection
+    volumes:
+      - ./data/images:/app/data/images
+      - ./models:/app/models
+      - ./config:/app/config
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_IMAGES_QUEUE=images
+      - REDIS_DETECTIONS_QUEUE=detections
+      - IMAGES_PATH=/app/data/images
+      - MODEL_PATH=${MODEL_PATH:-yolov8n.pt}
+      - CONFIDENCE_THRESHOLD=${CONFIDENCE_THRESHOLD:-0.4}
+    networks:
+      - bird-monitor-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "src/detection_service.py"]
+
+  # Storage Service (consumes detections from Redis, stores in PostgreSQL)
+  storage-service:
+    build:
+      context: ./services/storage
+      dockerfile: Dockerfile
+    container_name: bird-monitor-storage
+    volumes:
+      - ./data/images:/app/data/images
+      - ./config:/app/config
+      - ./shared:/app/shared
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DETECTIONS_QUEUE=detections
+      - IMAGES_PATH=/app/data/images
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=birdmonitor
+      - POSTGRES_USER=birdmonitor
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme265}
+      - ZIP_CODE=${ZIP_CODE:-34232}
+    networks:
+      - bird-monitor-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "src/storage_service.py"]
+
+  # Notification Service (consumes detections from Redis, sends Slack notifications)
+  notification-service:
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+    container_name: bird-monitor-notification
+    volumes:
+      - ./data/images:/app/data/images
+      - ./config:/app/config
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DETECTIONS_QUEUE=detections
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - NOTIFICATION_COOLDOWN=${NOTIFICATION_COOLDOWN:-300}
+      - MIN_CONFIDENCE=${MIN_CONFIDENCE:-0.5}
+    networks:
+      - bird-monitor-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "src/notification_service.py"]
+    profiles:
+      - notification  # Only start if explicitly enabled
+
+  # API Service (FastAPI REST API and frontend)
+  api-service:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: bird-monitor-api
+    volumes:
+      - ./data/images:/app/data/images
+      - ./config:/app/config
+      - ./services/api/static:/app/static
+      - ./shared:/app/shared
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=birdmonitor
+      - POSTGRES_USER=birdmonitor
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme265}
+      - IMAGES_PATH=/app/data/images
+      - STATIC_PATH=/app/static
+      - ZIP_CODE=${ZIP_CODE:-34232}
+    ports:
+      - "8000:8000"
+    networks:
+      - bird-monitor-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Webcam test service (for testing RTSP stream)
+  webcam-test-rtsp:
+    build:
+      context: ./services/capture
+      dockerfile: Dockerfile
+    container_name: bird-monitor-webcam-test-rtsp
+    networks:
+      - bird-monitor-network
+    environment:
+      - RTSP_URL=${RTSP_URL:-rtsp://host.docker.internal:8554/webcam}
+    command: ["python", "src/webcam_test_rtsp.py"]
+    profiles:
+      - test
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  bird-monitor-network:
+    driver: bridge
+
+# Note: RTSP streaming setup
+# 
+# On macOS:
+# 1. Install MediaMTX: brew install mediamtx
+# 2. Start RTSP server: ./scripts/start_rtsp_server.sh
+# 3. Stream webcam: ./scripts/stream_webcam_to_rtsp.sh
+# 4. Start Docker services: docker-compose up
+#
+# On Linux:
+# 1. Install MediaMTX or use FFmpeg's RTSP server
+# 2. Stream webcam to RTSP
+# 3. Update CAMERA_URL in .env to use host IP instead of host.docker.internal
+#
+# The capture-service will automatically connect to the RTSP stream.
+
