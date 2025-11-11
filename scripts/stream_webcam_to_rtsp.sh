@@ -53,27 +53,27 @@ echo ""
 
 # Stream to RTSP using FFmpeg
 # Using avfoundation for macOS camera input
-# Optimized for stability over latency - prevents H.264 decoder errors
-# Using slower preset and larger buffers for more reliable encoding
+# Optimized for HIGH QUALITY STILL IMAGES - quality over latency
+# Settings prioritize image quality since we're capturing stills, not watching video
 ffmpeg -hide_banner -loglevel warning \
     -f avfoundation \
     -framerate ${FPS} \
     -video_size ${RESOLUTION} \
     -i "${CAMERA_DEVICE}:none" \
     -c:v libx264 \
-    -preset medium \
-    -tune film \
-    -profile:v baseline \
-    -level 3.1 \
+    -preset slow \
+    -tune stillimage \
+    -profile:v high \
+    -level 4.0 \
     -pix_fmt yuv420p \
-    -b:v 4M \
-    -maxrate 4M \
-    -bufsize 8M \
-    -g ${FPS} \
-    -keyint_min ${FPS} \
-    -sc_threshold 0 \
-    -bf 0 \
-    -x264-params "keyint=${FPS}:min-keyint=${FPS}:scenecut=0:force-cfr=1:nal-hrd=cbr:ref=1:no-mbtree=1" \
+    -b:v 8M \
+    -maxrate 10M \
+    -bufsize 20M \
+    -g $((FPS * 2)) \
+    -keyint_min $((FPS * 2)) \
+    -sc_threshold 40 \
+    -bf 3 \
+    -x264-params "keyint=$((FPS * 2)):min-keyint=$((FPS * 2)):scenecut=40:force-cfr=1:ref=4:me=umh:subme=8:merange=24:trellis=2:fast-pskip=0" \
     -fflags +genpts+igndts \
     -avoid_negative_ts make_zero \
     -vsync cfr \

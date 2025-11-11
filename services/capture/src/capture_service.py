@@ -246,7 +246,7 @@ class CaptureService:
         return motion_detected, frame
     
     def save_image(self, frame, timestamp):
-        """Save image to disk."""
+        """Save image to disk with high quality JPEG encoding."""
         images_path = Path(self.config.get('images_path', 'data/images'))
         date_path = images_path / timestamp.strftime('%Y-%m') / timestamp.strftime('%d')
         date_path.mkdir(parents=True, exist_ok=True)
@@ -254,8 +254,26 @@ class CaptureService:
         filename = f"{timestamp.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
         filepath = date_path / filename
         
-        cv2.imwrite(str(filepath), frame)
+        # Use high quality JPEG (95/100) for still images - quality over file size
+        jpeg_quality = self.config.get('jpeg_quality', 95)
+        cv2.imwrite(str(filepath), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
         return str(filepath.relative_to(images_path))
+    
+    def measure_sharpness(self, frame):
+        """Measure frame sharpness using Laplacian variance (higher = sharper)."""
+        if frame is None:
+            return 0.0
+        
+        # Convert to grayscale if needed
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+        
+        # Apply Laplacian filter and compute variance
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        sharpness = laplacian.var()
+        return sharpness
     
     def capture_frame(self):
         """Capture a single frame from the camera."""
@@ -273,6 +291,39 @@ class CaptureService:
             return None
         
         return frame
+    
+    def capture_best_frame(self, num_samples=5, sample_interval=0.1):
+        """
+        Capture multiple frames and return the sharpest one.
+        This helps avoid motion blur by selecting the frame with least blur.
+        
+        Args:
+            num_samples: Number of frames to sample
+            sample_interval: Time in seconds between samples
+        
+        Returns:
+            Best (sharpest) frame, or None if capture fails
+        """
+        if not self.cap or not self.cap.isOpened():
+            return None
+        
+        best_frame = None
+        best_sharpness = 0.0
+        
+        # Sample multiple frames and pick the sharpest
+        for i in range(num_samples):
+            ret, frame = self.cap.read()
+            if ret and frame is not None and self.is_valid_frame(frame):
+                sharpness = self.measure_sharpness(frame)
+                if sharpness > best_sharpness:
+                    best_sharpness = sharpness
+                    best_frame = frame.copy()
+            
+            # Wait between samples (except on last iteration)
+            if i < num_samples - 1:
+                time.sleep(sample_interval)
+        
+        return best_frame
     
     def publish_to_redis(self, image_path, metadata):
         """Publish image info to Redis queue."""
@@ -362,7 +413,9 @@ class CaptureService:
         last_capture_time = time.time()  # Initialize to current time, not 0
         last_status_time = time.time()
         cooldown = self.config.get('motion_cooldown', 10.0)  # seconds
-        motion_delay = self.config.get('motion_delay', 0.5)  # seconds to wait after motion detected before capturing
+        motion_delay = self.config.get('motion_delay', 1.5)  # seconds to wait after motion detected before capturing (increased for sharper images)
+        capture_samples = self.config.get('capture_samples', 5)  # number of frames to sample when capturing
+        capture_sample_interval = self.config.get('capture_sample_interval', 0.1)  # seconds between samples
         frame_count = 0
         motion_detections = 0
         # Calculate warmup frames based on FPS (5 seconds worth)
@@ -443,9 +496,23 @@ class CaptureService:
                 if should_capture:
                     motion_detections += 1
                     time_since_last = current_time - last_capture_time
-                    print(f"✓ Motion detected and capturing! (event #{motion_detections}, {time_since_last:.1f}s since last capture, {current_time - motion_detected_time:.1f}s after motion start)", flush=True)
+                    print(f"✓ Motion detected, waiting for motion to settle... (event #{motion_detections}, {time_since_last:.1f}s since last capture, {current_time - motion_detected_time:.1f}s after motion start)", flush=True)
+                    
+                    # Wait a bit more for motion to settle, then capture the sharpest frame
+                    time.sleep(0.3)  # Additional brief wait for motion to settle
+                    
+                    # Capture multiple frames and pick the sharpest one
+                    best_frame = self.capture_best_frame(
+                        num_samples=capture_samples,
+                        sample_interval=capture_sample_interval
+                    )
+                    
+                    if best_frame is None:
+                        print(f"Warning: Failed to capture best frame, using current frame", flush=True)
+                        best_frame = frame
+                    
                     timestamp = datetime.now()
-                    image_path = self.save_image(frame, timestamp)
+                    image_path = self.save_image(best_frame, timestamp)
                     
                     metadata = {
                         'timestamp': timestamp.isoformat(),  # Convert to string for JSON serialization
@@ -487,7 +554,10 @@ def load_config():
         'motion_threshold': int(os.getenv('MOTION_THRESHOLD', 50)),
         'motion_min_area': int(os.getenv('MOTION_MIN_AREA', 3000)),  # Lower = more sensitive (default: 3000 for moderate sensitivity)
         'motion_cooldown': float(os.getenv('MOTION_COOLDOWN', 5.0)),  # Lower = more frequent captures (default: 5.0s)
-        'motion_delay': float(os.getenv('MOTION_DELAY', 0.5)),  # Delay after motion detected before capturing (default: 0.5s)
+        'motion_delay': float(os.getenv('MOTION_DELAY', 1.5)),  # Delay after motion detected before capturing (default: 1.5s for sharper images)
+        'capture_samples': int(os.getenv('CAPTURE_SAMPLES', 5)),  # Number of frames to sample when capturing (default: 5)
+        'capture_sample_interval': float(os.getenv('CAPTURE_SAMPLE_INTERVAL', 0.1)),  # Seconds between samples (default: 0.1s)
+        'jpeg_quality': int(os.getenv('JPEG_QUALITY', 95)),  # JPEG quality for saved images (1-100, default: 95 for high quality)
         'motion_mog2_var_threshold': float(os.getenv('MOTION_MOG2_VAR_THRESHOLD', 35)),  # MOG2 sensitivity (lower = more sensitive, default: 35)
         'motion_binary_threshold': int(os.getenv('MOTION_BINARY_THRESHOLD', 175)),  # Binary threshold (lower = more sensitive, default: 175)
         'http_port': int(os.getenv('CAPTURE_HTTP_PORT', 8080)),  # HTTP server port for live capture

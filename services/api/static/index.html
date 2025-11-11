@@ -117,6 +117,12 @@
             width: 100%;
             height: 200px;
             object-fit: cover;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        
+        .detection-card img:hover {
+            opacity: 0.9;
         }
         
         .detection-info {
@@ -281,6 +287,47 @@
             color: white;
             border-color: #3498db;
         }
+        
+        /* Modal/Lightbox styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.9);
+            cursor: pointer;
+        }
+        
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .modal-content {
+            max-width: 90%;
+            max-height: 90%;
+            object-fit: contain;
+            cursor: default;
+        }
+        
+        .modal-close {
+            position: absolute;
+            top: 20px;
+            right: 35px;
+            color: #f1f1f1;
+            font-size: 40px;
+            font-weight: bold;
+            cursor: pointer;
+            z-index: 1001;
+        }
+        
+        .modal-close:hover {
+            color: #bbb;
+        }
     </style>
 </head>
 <body>
@@ -351,6 +398,12 @@
         </div>
         
         <div class="pagination" id="pagination"></div>
+        
+        <!-- Modal for enlarged images -->
+        <div id="imageModal" class="modal" onclick="closeModal()">
+            <span class="modal-close" onclick="closeModal(event)">&times;</span>
+            <img class="modal-content" id="modalImage" src="" alt="Enlarged detection image" onclick="event.stopPropagation()">
+        </div>
     </div>
     
     <script>
@@ -461,6 +514,7 @@
                         <div class="detection-card">
                             <img src="/api/images/${detection.image_path}" 
                                  alt="Detection ${detection.id}"
+                                 onclick="openModal('/api/images/${detection.image_path}')"
                                  onerror="this.src='data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'300\' height=\'200\'%3E%3Crect fill=\'%23ddd\' width=\'300\' height=\'200\'/%3E%3Ctext fill=\'%23999\' font-family=\'sans-serif\' font-size=\'14\' x=\'50%25\' y=\'50%25\' text-anchor=\'middle\' dy=\'.3em\'%3EImage not found%3C/text%3E%3C/svg%3E'">
                             <div class="detection-info">
                                 <h3>
@@ -595,6 +649,31 @@
         setInterval(loadStats, 30000);
         // Refresh weather every 5 minutes
         setInterval(loadWeather, 300000);
+        
+        // Modal functions for image enlargement
+        function openModal(imageSrc) {
+            const modal = document.getElementById('imageModal');
+            const modalImg = document.getElementById('modalImage');
+            modal.classList.add('active');
+            modalImg.src = imageSrc;
+            document.body.style.overflow = 'hidden'; // Prevent background scrolling
+        }
+        
+        function closeModal(event) {
+            if (event) {
+                event.stopPropagation(); // Prevent event bubbling
+            }
+            const modal = document.getElementById('imageModal');
+            modal.classList.remove('active');
+            document.body.style.overflow = 'auto'; // Restore scrolling
+        }
+        
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                closeModal();
+            }
+        });
     </script>
 </body>
 </html>
