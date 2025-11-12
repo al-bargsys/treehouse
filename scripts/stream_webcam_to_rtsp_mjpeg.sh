@@ -1,6 +1,12 @@
 #!/bin/bash
-# Stream macOS webcam to RTSP server using FFmpeg
+# Stream macOS webcam to RTSP server using FFmpeg with MJPEG (lightweight for still image capture)
 # This script should be run after starting the RTSP server
+#
+# MJPEG is much lighter than H.264 for still image capture because:
+# - Each frame is independently encoded (no inter-frame compression)
+# - Lower CPU usage (typically 10-30% vs 200%+ for H.264 slow preset)
+# - Still provides high quality for still images
+# - Easier to decode
 
 set -e
 
@@ -18,7 +24,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo "=========================================="
-echo "Webcam to RTSP Stream"
+echo "Webcam to RTSP Stream (MJPEG - Lightweight)"
 echo "=========================================="
 echo ""
 
@@ -46,50 +52,38 @@ echo "  Camera Device: ${CAMERA_DEVICE}"
 echo "  Resolution: ${RESOLUTION}"
 echo "  FPS: ${FPS}"
 echo "  RTSP URL: ${RTSP_URL}"
+echo "  Codec: MJPEG (lightweight for still image capture)"
 echo ""
 echo -e "${GREEN}Starting stream...${NC}"
 echo "Press Ctrl+C to stop"
 echo ""
 
-# Stream to RTSP using FFmpeg
-# Using avfoundation for macOS camera input
+# Stream to RTSP using FFmpeg with MJPEG
+# MJPEG is perfect for still image capture:
+# - Each frame is independently encoded (no motion estimation)
+# - Much lower CPU usage than H.264
+# - High quality for still images
+# - Quality setting (q:v) ranges from 2-31, lower = better quality
 #
-# NOTE: This uses H.264 with "slow" preset which is CPU-intensive (200%+ CPU).
-# For still image capture, consider using MJPEG instead (see stream_webcam_to_rtsp_mjpeg.sh)
-# which uses ~10-30% CPU with similar image quality.
+# Note: MJPEG over RTSP can be problematic. If this fails, try:
+# - stream_webcam_to_rtsp_lightweight.sh (H.264 veryfast preset)
+# - stream_webcam_to_http_mjpeg.sh (HTTP MJPEG stream)
 #
-# H.264 advantages: Better compression, lower bandwidth
-# MJPEG advantages: Much lower CPU, simpler decoding, better for still image capture
-#
-# Optimized for HIGH QUALITY STILL IMAGES - quality over latency
-# Settings prioritize image quality since we're capturing stills, not watching video
+# Convert from camera's native format (uyvy422) to yuvj422p for MJPEG
+# Set pixel range correctly to avoid deprecation warnings
 ffmpeg -hide_banner -loglevel warning \
     -f avfoundation \
     -framerate ${FPS} \
     -video_size ${RESOLUTION} \
+    -pixel_format uyvy422 \
     -i "${CAMERA_DEVICE}:none" \
-    -c:v libx264 \
-    -preset slow \
-    -tune stillimage \
-    -profile:v high \
-    -level 4.0 \
-    -pix_fmt yuv420p \
-    -b:v 8M \
-    -maxrate 10M \
-    -bufsize 20M \
-    -g $((FPS * 2)) \
-    -keyint_min $((FPS * 2)) \
-    -sc_threshold 40 \
-    -bf 3 \
-    -x264-params "keyint=$((FPS * 2)):min-keyint=$((FPS * 2)):scenecut=40:force-cfr=1:ref=4:me=umh:subme=8:merange=24:trellis=2:fast-pskip=0" \
-    -fflags +genpts+igndts \
-    -avoid_negative_ts make_zero \
-    -vsync cfr \
+    -vf "format=yuvj422p" \
+    -c:v mjpeg \
+    -q:v 3 \
     -r ${FPS} \
     -f rtsp \
     -rtsp_transport tcp \
-    -muxdelay 1.0 \
     -rtsp_flags prefer_tcp \
     "${RTSP_URL}" 2>&1 | grep -v --line-buffered \
-        "VBV underflow\|Non-monotonic DTS\|Invalid level prefix\|corrupted macroblock\|error while decoding\|co located POCs\|mmco: unref\|reference picture missing\|Missing reference picture\|illegal short term buffer\|bytestream" || true
+        "VBV underflow\|Non-monotonic DTS\|Invalid level prefix\|corrupted macroblock\|error while decoding\|co located POCs\|mmco: unref\|reference picture missing\|Missing reference picture\|illegal short term buffer\|bytestream\|Only 1x1 chroma blocks\|not enough frames to estimate rate\|deprecated pixel format\|Configuration of video device failed" || true
 

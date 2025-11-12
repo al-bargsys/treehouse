@@ -20,6 +20,8 @@ class DetectionBase(BaseModel):
     detected_at: Optional[datetime] = None
     created_at: datetime
     weather: Optional[Dict[str, Any]] = None
+    bird_name: Optional[str] = None
+    bird_backstory: Optional[str] = None
 
 class DetectionResponse(DetectionBase):
     """Detection response model."""

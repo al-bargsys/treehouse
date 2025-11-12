@@ -89,6 +89,14 @@ class Database:
                                       WHERE table_name='detections' AND column_name='weather') THEN
                             ALTER TABLE detections ADD COLUMN weather JSONB;
                         END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                      WHERE table_name='detections' AND column_name='bird_name') THEN
+                            ALTER TABLE detections ADD COLUMN bird_name TEXT;
+                        END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                      WHERE table_name='detections' AND column_name='bird_backstory') THEN
+                            ALTER TABLE detections ADD COLUMN bird_backstory TEXT;
+                        END IF;
                     END $$;
                 """)
                 
@@ -140,9 +148,11 @@ class Database:
                 cur.execute("""
                     INSERT INTO detections (
                         timestamp, image_path, is_bird, is_human, category, confidence, species,
-                        bounding_boxes, motion_score, metadata, detected_at, weather
+                        bounding_boxes, motion_score, metadata, detected_at, weather,
+                        bird_name, bird_backstory
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s::jsonb,
+                        %s, %s
                     )
                     RETURNING id;
                 """, (
@@ -157,7 +167,9 @@ class Database:
                     detection_data.get('motion_score'),
                     json.dumps(detection_data.get('metadata', {})),
                     detection_data.get('detected_at'),
-                    json.dumps(detection_data.get('weather')) if detection_data.get('weather') else None
+                    json.dumps(detection_data.get('weather')) if detection_data.get('weather') else None,
+                    detection_data.get('bird_name'),
+                    detection_data.get('bird_backstory')
                 ))
                 
                 detection_id = cur.fetchone()[0]

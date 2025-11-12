@@ -18,6 +18,141 @@
             line-height: 1.6;
         }
         
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: #1a1a1a;
+                color: #e0e0e0;
+            }
+            
+            header {
+                background: #2d2d2d;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            }
+            
+            h1 {
+                color: #f0f0f0;
+            }
+            
+            .stat-card {
+                background: #2d2d2d;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            }
+            
+            .stat-label {
+                color: #b0b0b0;
+            }
+            
+            .filters {
+                background: #2d2d2d;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            }
+            
+            .filters select, .filters button {
+                background: #3d3d3d;
+                color: #e0e0e0;
+                border-color: #555;
+            }
+            
+            .filters button:hover {
+                background: #4d4d4d;
+            }
+            
+            .detection-card {
+                background: #2d2d2d;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            }
+            
+            .detection-info h3 {
+                color: #f0f0f0;
+            }
+            
+            .live-view {
+                background: #2d2d2d;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            }
+            
+            .live-view h2 {
+                color: #f0f0f0;
+            }
+            
+            .live-info {
+                background: #3d3d3d;
+            }
+            
+            .live-info p {
+                color: #d0d0d0;
+            }
+            
+            .live-controls button {
+                background: #3d3d3d;
+                color: #e0e0e0;
+                border-color: #555;
+            }
+            
+            .live-controls button:hover {
+                background: #4d4d4d;
+            }
+            
+            .pagination button {
+                background: #3d3d3d;
+                color: #e0e0e0;
+                border-color: #555;
+            }
+            
+            .pagination button:hover:not(:disabled) {
+                background: #4d4d4d;
+            }
+            
+            .loading {
+                color: #b0b0b0;
+            }
+            
+            .live-status {
+                color: #b0b0b0 !important;
+            }
+            
+            .detection-info p {
+                color: #d0d0d0;
+            }
+            
+            .weather-card {
+                background: #2d2d2d;
+            }
+            
+            .weather-card .stat-label {
+                color: #b0b0b0;
+            }
+            
+            .weather-card .stat-value {
+                color: #3498db;
+            }
+            
+            .detection-info div[style*="border-top"] {
+                border-top-color: #555 !important;
+            }
+            
+            .detection-info div[style*="color: #555"] {
+                color: #d0d0d0 !important;
+            }
+            
+            .detection-info div[style*="color: #666"] {
+                color: #c0c0c0 !important;
+            }
+            
+            .detection-info div[style*="background: #f0f8ff"] {
+                background: #2a3a4a !important;
+                border-left-color: #3498db !important;
+            }
+            
+            .detection-info div[style*="color: #2c3e50"] {
+                color: #f0f0f0 !important;
+            }
+            
+            .detection-info div[style*="color: #555"][style*="font-style: italic"] {
+                color: #d0d0d0 !important;
+            }
+        }
+        
         .container {
             max-width: 1200px;
             margin: 0 auto;
@@ -231,6 +366,24 @@
             background: #2ecc71;
         }
         
+        .low-light-indicator {
+            display: inline-block;
+            margin-left: 15px;
+            padding: 4px 12px;
+            background: #34495e;
+            color: #ecf0f1;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 500;
+            opacity: 0.9;
+            animation: fadeIn 0.3s ease-in;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 0.9; }
+        }
+        
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
@@ -328,6 +481,28 @@
         .modal-close:hover {
             color: #bbb;
         }
+        
+        .delete-button {
+            background: #e74c3c;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+            margin-top: 10px;
+            width: 100%;
+            transition: background 0.2s;
+        }
+        
+        .delete-button:hover {
+            background: #c0392b;
+        }
+        
+        .delete-button:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -367,6 +542,9 @@
             <h2>
                 <span class="live-indicator" id="live-indicator"></span>
                 Live View
+                <span id="low-light-indicator" class="low-light-indicator" style="display: none;" title="Low light conditions detected">
+                    🌙 Low Light
+                </span>
             </h2>
             <div class="live-image-container" id="live-image-container">
                 <div class="loading">Loading live image...</div>
@@ -386,6 +564,16 @@
                     <option value="bird">Birds Only</option>
                     <option value="human">Humans Only</option>
                     <option value="both">Both Birds & Humans</option>
+                </select>
+            </label>
+            <label>
+                Filter by Time:
+                <select id="filter-time">
+                    <option value="">All Time</option>
+                    <option value="24h">Last 24 Hours</option>
+                    <option value="7d">Last 7 Days</option>
+                    <option value="30d">Last 30 Days</option>
+                    <option value="90d">Last 90 Days</option>
                 </select>
             </label>
             <button onclick="loadDetections()">Refresh</button>
@@ -475,6 +663,7 @@
             
             try {
                 const filterCategory = document.getElementById('filter-category').value;
+                const filterTime = document.getElementById('filter-time').value;
                 const params = new URLSearchParams({
                     page: page.toString(),
                     page_size: pageSize.toString()
@@ -482,6 +671,30 @@
                 
                 if (filterCategory) {
                     params.append('category', filterCategory);
+                }
+                
+                // Calculate date range based on time filter
+                if (filterTime) {
+                    const now = new Date();
+                    let startDate = new Date();
+                    
+                    switch (filterTime) {
+                        case '24h':
+                            startDate.setHours(now.getHours() - 24);
+                            break;
+                        case '7d':
+                            startDate.setDate(now.getDate() - 7);
+                            break;
+                        case '30d':
+                            startDate.setDate(now.getDate() - 30);
+                            break;
+                        case '90d':
+                            startDate.setDate(now.getDate() - 90);
+                            break;
+                    }
+                    
+                    // Format as ISO 8601 string
+                    params.append('start_date', startDate.toISOString());
                 }
                 
                 const response = await fetch(`/api/detections?${params}`);
@@ -523,6 +736,12 @@
                                     </span>
                                     ${detection.confidence ? `Confidence: ${(detection.confidence * 100).toFixed(1)}%` : ''}
                                 </h3>
+                                ${detection.bird_name ? `
+                                    <div style="margin: 10px 0; padding: 10px; background: #f0f8ff; border-radius: 4px; border-left: 3px solid #3498db;">
+                                        <p style="margin: 0; font-weight: bold; color: #2c3e50; font-size: 1.1em;">🐦 ${detection.bird_name}</p>
+                                        ${detection.bird_backstory ? `<p style="margin: 5px 0 0 0; color: #555; font-style: italic; font-size: 0.9em;">${detection.bird_backstory}</p>` : ''}
+                                    </div>
+                                ` : ''}
                                 <p><strong>Time:</strong> ${new Date(detection.timestamp).toLocaleString()}</p>
                                 ${numDetections ? `<p><strong>Total Detections:</strong> ${numDetections}</p>` : ''}
                                 ${numBirds > 0 ? `<p><strong>Birds:</strong> ${numBirds}</p>` : ''}
@@ -538,6 +757,9 @@
                                         ${detection.weather.wind_speed !== null && detection.weather.wind_speed !== undefined ? `<p style="font-size: 0.85em; color: #666;">Wind: ${detection.weather.wind_speed.toFixed(1)} km/h</p>` : ''}
                                     </div>
                                 ` : ''}
+                                <button class="delete-button" onclick="deleteDetection(${detection.id}, event)">
+                                    🗑️ Delete
+                                </button>
                             </div>
                         </div>
                     `;
@@ -571,11 +793,29 @@
             const container = document.getElementById('live-image-container');
             const status = document.getElementById('live-status');
             const indicator = document.getElementById('live-indicator');
+            const lowLightIndicator = document.getElementById('low-light-indicator');
             
             try {
                 // Request live frame - it returns the image directly
                 const timestamp = new Date();
                 const imageUrl = `/api/live?t=${Date.now()}`;
+                
+                // Also check capture status for low light detection
+                try {
+                    const statusResponse = await fetch('/api/capture-status');
+                    if (statusResponse.ok) {
+                        const captureStatus = await statusResponse.json();
+                        if (captureStatus.low_light) {
+                            lowLightIndicator.style.display = 'inline-block';
+                            lowLightIndicator.title = `Low light conditions (brightness: ${(captureStatus.brightness * 100).toFixed(1)}%)`;
+                        } else {
+                            lowLightIndicator.style.display = 'none';
+                        }
+                    }
+                } catch (statusError) {
+                    // If status check fails, just hide the indicator
+                    lowLightIndicator.style.display = 'none';
+                }
                 
                 container.innerHTML = `
                     <img src="${imageUrl}" 
@@ -595,6 +835,7 @@
                 container.innerHTML = '<div class="loading">Error loading live image</div>';
                 status.textContent = 'Error';
                 indicator.classList.remove('active');
+                lowLightIndicator.style.display = 'none';
             }
         }
         
@@ -639,6 +880,21 @@
             }
         }
         
+        // Add event listeners for filter changes
+        const filterTime = document.getElementById('filter-time');
+        if (filterTime) {
+            filterTime.addEventListener('change', function() {
+                loadDetections(1); // Reset to page 1 when filter changes
+            });
+        }
+        
+        const filterCategory = document.getElementById('filter-category');
+        if (filterCategory) {
+            filterCategory.addEventListener('change', function() {
+                loadDetections(1); // Reset to page 1 when filter changes
+            });
+        }
+        
         // Load data on page load
         loadStats();
         loadWeather();
@@ -674,6 +930,56 @@
                 closeModal();
             }
         });
+        
+        async function deleteDetection(detectionId, event) {
+            // Prevent event bubbling
+            if (event) {
+                event.stopPropagation();
+                event.preventDefault();
+            }
+            
+            // Confirm deletion
+            if (!confirm(`Are you sure you want to delete detection #${detectionId}?`)) {
+                return;
+            }
+            
+            // Find the button and disable it
+            const button = event ? (event.target.tagName === 'BUTTON' ? event.target : event.target.closest('button')) : null;
+            const originalText = button ? button.textContent : '';
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Deleting...';
+            }
+            
+            try {
+                const response = await fetch(`/api/detections/${detectionId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (response.status === 204) {
+                    // Success - reload detections and stats
+                    await loadDetections(currentPage);
+                    await loadStats();
+                } else if (response.status === 404) {
+                    alert('Detection not found. It may have already been deleted.');
+                    await loadDetections(currentPage);
+                } else {
+                    const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
+                    alert(`Error deleting detection: ${error.detail || 'Unknown error'}`);
+                    if (button) {
+                        button.disabled = false;
+                        button.textContent = originalText;
+                    }
+                }
+            } catch (error) {
+                console.error('Error deleting detection:', error);
+                alert(`Error deleting detection: ${error.message}`);
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = originalText;
+                }
+            }
+        }
     </script>
 </body>
 </html>

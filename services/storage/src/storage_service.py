@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime
 from database import Database
 from shared.utils.weather import get_weather_for_zip
+from shared.utils.openai_client import OpenAIBirdNamer
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +30,8 @@ class StorageService:
         self.redis_client = None
         self.db = None
         self.running = False
+        # Initialize OpenAI client (optional - will be None if no API key)
+        self.openai_namer = OpenAIBirdNamer()
     
     def connect_redis(self):
         """Connect to Redis server."""
@@ -97,10 +100,26 @@ class StorageService:
         except Exception as e:
             logger.warning(f"Error fetching weather data: {e}")
         
+        # Generate bird name and backstory if a bird is detected and OpenAI is enabled
+        bird_name = None
+        bird_backstory = None
+        is_bird = detection_data.get('is_bird', False)
+        if is_bird and self.openai_namer.enabled:
+            try:
+                logger.info("Bird detected - generating name and backstory via OpenAI...")
+                bird_name, bird_backstory = self.openai_namer.generate_name_and_backstory()
+                if bird_name:
+                    logger.info(f"Generated bird name: {bird_name}")
+                if bird_backstory:
+                    logger.info(f"Generated backstory for {bird_name}")
+            except Exception as e:
+                logger.warning(f"Error generating bird name/backstory: {e}")
+                # Continue without name/backstory if generation fails
+        
         db_record = {
             'timestamp': timestamp,
             'image_path': image_path,
-            'is_bird': detection_data.get('is_bird', False),
+            'is_bird': is_bird,
             'is_human': detection_data.get('is_human', False),
             'category': detection_data.get('category'),
             'confidence': detection_data.get('confidence'),
@@ -114,7 +133,9 @@ class StorageService:
                 'num_humans': detection_data.get('num_humans', 0)
             },
             'detected_at': detected_at,
-            'weather': weather_data
+            'weather': weather_data,
+            'bird_name': bird_name,
+            'bird_backstory': bird_backstory
         }
         
         # Insert into database

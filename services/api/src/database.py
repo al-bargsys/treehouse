@@ -264,6 +264,27 @@ class Database:
         finally:
             self.return_connection(conn)
     
+    def delete_detection(self, detection_id: int) -> bool:
+        """Delete a detection by ID."""
+        conn = self.get_connection()
+        if not conn:
+            return False
+        
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM detections WHERE id = %s", (detection_id,))
+                conn.commit()
+                deleted = cur.rowcount > 0
+                if deleted:
+                    logger.info(f"Deleted detection {detection_id}")
+                return deleted
+        except Exception as e:
+            logger.error(f"Error deleting detection {detection_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            self.return_connection(conn)
+    
     def close(self):
         """Close all connections in the pool."""
         if self.connection_pool:

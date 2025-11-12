@@ -8,7 +8,7 @@ import logging
 import requests
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -67,6 +67,22 @@ async def shutdown_event():
     db.close()
 
 # Health check endpoint
+@app.get("/api/capture-status")
+async def get_capture_status():
+    """Get capture service status including low light detection."""
+    capture_url = config['capture_service_url']
+    
+    try:
+        response = requests.get(
+            f"{capture_url}/capture/status",
+            timeout=3
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error requesting capture status: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to get capture status: {str(e)}")
+
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
@@ -117,6 +133,22 @@ async def get_detection(detection_id: int):
     if not detection:
         raise HTTPException(status_code=404, detail="Detection not found")
     return DetectionResponse(**detection)
+
+# Delete detection by ID
+@app.delete("/api/detections/{detection_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_detection(detection_id: int):
+    """Delete a detection by ID."""
+    # First check if detection exists
+    detection = db.get_detection_by_id(detection_id)
+    if not detection:
+        raise HTTPException(status_code=404, detail="Detection not found")
+    
+    # Delete the detection
+    success = db.delete_detection(detection_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete detection")
+    
+    return None
 
 # Get statistics
 @app.get("/api/stats", response_model=StatsResponse)

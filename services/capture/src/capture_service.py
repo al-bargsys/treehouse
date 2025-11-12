@@ -97,10 +97,23 @@ class CaptureService:
         self.cap = None
         self.background_accumulator = None  # For gradual background updates
         self.running = False
+        # Thread safety for VideoCapture access
+        self.cap_lock = threading.Lock()
+        # Frame buffer for HTTP endpoint (last good frame)
+        self.last_good_frame = None
+        self.last_frame_lock = threading.Lock()
+        # Low light detection
+        self.current_brightness = 0.0
+        self.is_low_light = False
+        self.brightness_lock = threading.Lock()
         # Error tracking metrics
         self.frame_errors = 0
         self.corrupted_frames = 0
         self.total_frames = 0
+        self.consecutive_errors = 0  # Track consecutive errors for reconnection
+        # Reconnection settings
+        self.max_consecutive_errors = 50  # Reconnect after this many consecutive errors
+        self.reconnect_delay = 5.0  # Seconds to wait before reconnecting
         # Use MOG2 background subtractor - handles lighting changes and camera auto-adjustments
         # Lower varThreshold = more sensitive to motion
         mog2_var_threshold = self.config.get('motion_mog2_var_threshold', 25)
@@ -135,57 +148,80 @@ class CaptureService:
             traceback.print_exc()
             return False
     
+    def close_camera(self):
+        """Safely close the camera connection."""
+        with self.cap_lock:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception as e:
+                    print(f"Error closing camera: {e}", flush=True)
+                finally:
+                    self.cap = None
+                    # Give it a moment to fully close
+                    time.sleep(0.5)
+    
     def open_camera(self):
         """Open camera stream (RTSP or direct device)."""
+        # Close existing connection if any
+        self.close_camera()
+        
         camera_source = self.config.get('camera_url') or self.config.get('camera_device', 0)
         
         print(f"Opening camera source: {camera_source}", flush=True)
         
-        # Check if it's an RTSP URL
-        if isinstance(camera_source, str) and camera_source.startswith(('rtsp://', 'http://', 'https://')):
-            print("Detected RTSP/HTTP stream", flush=True)
-            print("Creating VideoCapture object...", flush=True)
-            self.cap = cv2.VideoCapture(camera_source, cv2.CAP_FFMPEG)
-            print("VideoCapture object created, checking if opened...", flush=True)
-            
-            # Set RTSP-specific options for better error handling
-            # Use TCP transport for more reliable streaming (less packet loss)
-            # Note: These options may not all be available depending on OpenCV build
-            try:
-                # Buffer size: Increased for stability (latency not critical)
-                # Larger buffer helps prevent decoder errors from frame drops
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)  # Larger buffer for stability
-            except:
-                pass  # Some backends don't support this property
-        else:
-            # Direct device access
-            print(f"Using direct device access: {camera_source}", flush=True)
-            self.cap = cv2.VideoCapture(int(camera_source))
+        with self.cap_lock:
+            # Check if it's an RTSP URL
+            if isinstance(camera_source, str) and camera_source.startswith(('rtsp://', 'http://', 'https://')):
+                print("Detected RTSP/HTTP stream", flush=True)
+                print("Creating VideoCapture object...", flush=True)
+                self.cap = cv2.VideoCapture(camera_source, cv2.CAP_FFMPEG)
+                print("VideoCapture object created, checking if opened...", flush=True)
+                
+                # Set RTSP-specific options for better error handling
+                # Use TCP transport for more reliable streaming (latency not critical)
+                # Note: These options may not all be available depending on OpenCV build
+                try:
+                    # Buffer size: Increased for stability (latency not critical)
+                    # Larger buffer helps prevent decoder errors from frame drops
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)  # Larger buffer for stability
+                except:
+                    pass  # Some backends don't support this property
+            else:
+                # Direct device access
+                print(f"Using direct device access: {camera_source}", flush=True)
+                self.cap = cv2.VideoCapture(int(camera_source))
         
         # Give it a moment to connect
-        import time
         time.sleep(1)
         
-        if not self.cap.isOpened():
-            print(f"ERROR: Could not open camera source: {camera_source}", flush=True)
-            return False
-        print("Camera opened successfully, getting properties...", flush=True)
+        with self.cap_lock:
+            if not self.cap or not self.cap.isOpened():
+                print(f"ERROR: Could not open camera source: {camera_source}", flush=True)
+                return False
+            print("Camera opened successfully, getting properties...", flush=True)
+            
+            # Set camera properties if specified
+            if 'resolution' in self.config:
+                width, height = self.config['resolution']
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            
+            if 'fps' in self.config:
+                self.cap.set(cv2.CAP_PROP_FPS, self.config['fps'])
+            
+            # Get actual properties
+            try:
+                width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                print(f"✓ Camera opened: {width}x{height} @ {fps} FPS", flush=True)
+            except Exception as e:
+                print(f"Warning: Could not get camera properties: {e}", flush=True)
+                print("✓ Camera opened (properties unavailable)", flush=True)
         
-        # Set camera properties if specified
-        if 'resolution' in self.config:
-            width, height = self.config['resolution']
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        
-        if 'fps' in self.config:
-            self.cap.set(cv2.CAP_PROP_FPS, self.config['fps'])
-        
-        # Get actual properties
-        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        
-        print(f"✓ Camera opened: {width}x{height} @ {fps} FPS", flush=True)
+        # Reset error counters on successful connection
+        self.consecutive_errors = 0
         return True
     
     def is_valid_frame(self, frame):
@@ -201,17 +237,20 @@ class CaptureService:
         if width < 10 or height < 10:  # Minimum reasonable dimensions
             return False
         
-        # Check if frame is not completely black or white (basic corruption check)
-        # This is a simple heuristic - a completely uniform frame might indicate corruption
+        # Check if frame is completely uniform (basic corruption check)
+        # Only reject frames with std dev of exactly 0.0 (completely uniform)
+        # This allows low-contrast scenes, dark rooms, and uniform backgrounds
         if len(frame.shape) == 3:
             # Color frame
             std_dev = frame.std()
-            if std_dev < 1.0:  # Very low variation might indicate corruption
+            # Only reject if completely uniform (std dev == 0.0)
+            # Use a very small epsilon to account for floating point precision
+            if std_dev < 0.001:  # Essentially 0.0 - completely uniform frame
                 return False
         else:
             # Grayscale frame
             std_dev = frame.std()
-            if std_dev < 1.0:
+            if std_dev < 0.001:  # Essentially 0.0
                 return False
         
         return True
@@ -275,26 +314,59 @@ class CaptureService:
         sharpness = laplacian.var()
         return sharpness
     
-    def capture_frame(self):
-        """Capture a single frame from the camera."""
-        if not self.cap or not self.cap.isOpened():
-            return None
+    def measure_brightness(self, frame):
+        """Measure average brightness of frame (0-255 scale, converted to 0-1)."""
+        if frame is None:
+            return 0.0
         
-        # Read a few frames to get a fresh one (skip buffered frames)
-        for _ in range(3):
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
+        # Convert to grayscale if needed
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+        
+        # Calculate mean brightness (0-255) and normalize to 0-1
+        brightness = gray.mean() / 255.0
+        return brightness
+    
+    def capture_frame(self, skip_buffered=True):
+        """
+        Capture a single frame from the camera (thread-safe).
+        
+        Args:
+            skip_buffered: If True, skip buffered frames to get a fresh one (slower but fresher).
+                          If False, just read one frame (faster, for HTTP endpoint).
+        """
+        with self.cap_lock:
+            if not self.cap or not self.cap.isOpened():
                 return None
-        
-        # Validate frame
-        if not self.is_valid_frame(frame):
-            return None
-        
-        return frame
+            
+            try:
+                if skip_buffered:
+                    # Read a few frames to get a fresh one (skip buffered frames)
+                    for _ in range(3):
+                        ret, frame = self.cap.read()
+                        if not ret or frame is None:
+                            return None
+                else:
+                    # Just read one frame (faster for HTTP endpoint)
+                    ret, frame = self.cap.read()
+                    if not ret or frame is None:
+                        return None
+                
+                # Validate frame
+                if not self.is_valid_frame(frame):
+                    return None
+                
+                return frame
+            except Exception as e:
+                # Catch any exceptions from OpenCV/FFmpeg to prevent crashes
+                print(f"Error reading frame: {e}", flush=True)
+                return None
     
     def capture_best_frame(self, num_samples=5, sample_interval=0.1):
         """
-        Capture multiple frames and return the sharpest one.
+        Capture multiple frames and return the sharpest one (thread-safe).
         This helps avoid motion blur by selecting the frame with least blur.
         
         Args:
@@ -304,24 +376,30 @@ class CaptureService:
         Returns:
             Best (sharpest) frame, or None if capture fails
         """
-        if not self.cap or not self.cap.isOpened():
-            return None
-        
-        best_frame = None
-        best_sharpness = 0.0
-        
-        # Sample multiple frames and pick the sharpest
-        for i in range(num_samples):
-            ret, frame = self.cap.read()
-            if ret and frame is not None and self.is_valid_frame(frame):
-                sharpness = self.measure_sharpness(frame)
-                if sharpness > best_sharpness:
-                    best_sharpness = sharpness
-                    best_frame = frame.copy()
+        with self.cap_lock:
+            if not self.cap or not self.cap.isOpened():
+                return None
             
-            # Wait between samples (except on last iteration)
-            if i < num_samples - 1:
-                time.sleep(sample_interval)
+            best_frame = None
+            best_sharpness = 0.0
+            
+            try:
+                # Sample multiple frames and pick the sharpest
+                for i in range(num_samples):
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None and self.is_valid_frame(frame):
+                        sharpness = self.measure_sharpness(frame)
+                        if sharpness > best_sharpness:
+                            best_sharpness = sharpness
+                            best_frame = frame.copy()
+                    
+                    # Wait between samples (except on last iteration)
+                    if i < num_samples - 1:
+                        time.sleep(sample_interval)
+            except Exception as e:
+                # Catch any exceptions from OpenCV/FFmpeg to prevent crashes
+                print(f"Error in capture_best_frame: {e}", flush=True)
+                return None
         
         return best_frame
     
@@ -351,40 +429,77 @@ class CaptureService:
         @app.route('/capture/live', methods=['GET'])
         def get_live_frame():
             """Capture and return a live frame as JPEG."""
-            frame = self.capture_frame()
+            # Try to get a fresh frame (fast mode - single read, no buffering)
+            frame = self.capture_frame(skip_buffered=False)
+            
+            # If capture fails, try to use last good frame
             if frame is None:
-                return Response(
-                    "Failed to capture frame",
-                    status=503,
-                    mimetype='text/plain'
-                )
+                with self.last_frame_lock:
+                    if self.last_good_frame is not None:
+                        frame = self.last_good_frame
+                    else:
+                        return Response(
+                            "No frame available",
+                            status=503,
+                            mimetype='text/plain'
+                        )
             
             # Encode frame as JPEG
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ret:
+            try:
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not ret:
+                    return Response(
+                        "Failed to encode frame",
+                        status=500,
+                        mimetype='text/plain'
+                    )
+                
                 return Response(
-                    "Failed to encode frame",
+                    buffer.tobytes(),
+                    mimetype='image/jpeg',
+                    headers={
+                        'Cache-Control': 'no-cache, no-store, must-revalidate',
+                        'Pragma': 'no-cache',
+                        'Expires': '0'
+                    }
+                )
+            except Exception as e:
+                return Response(
+                    f"Error encoding frame: {str(e)}",
                     status=500,
                     mimetype='text/plain'
                 )
-            
-            return Response(
-                buffer.tobytes(),
-                mimetype='image/jpeg',
-                headers={
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
-                    'Pragma': 'no-cache',
-                    'Expires': '0'
-                }
-            )
         
         @app.route('/capture/health', methods=['GET'])
         def health():
             """Health check endpoint."""
-            if self.cap and self.cap.isOpened():
-                return {'status': 'healthy', 'camera': 'connected'}, 200
-            else:
-                return {'status': 'unhealthy', 'camera': 'disconnected'}, 503
+            with self.cap_lock:
+                if self.cap and self.cap.isOpened():
+                    with self.brightness_lock:
+                        return {
+                            'status': 'healthy',
+                            'camera': 'connected',
+                            'low_light': self.is_low_light,
+                            'brightness': round(self.current_brightness, 3)
+                        }, 200
+                else:
+                    return {'status': 'unhealthy', 'camera': 'disconnected'}, 503
+        
+        @app.route('/capture/status', methods=['GET'])
+        def status():
+            """Get capture service status including low light detection."""
+            with self.brightness_lock:
+                with self.cap_lock:
+                    camera_connected = self.cap is not None and self.cap.isOpened()
+                
+                return {
+                    'camera_connected': bool(camera_connected),
+                    'low_light': bool(self.is_low_light),
+                    'brightness': round(self.current_brightness, 3),
+                    'frame_errors': int(self.frame_errors),
+                    'corrupted_frames': int(self.corrupted_frames),
+                    'total_frames': int(self.total_frames)
+                }, 200
         
         # Get port from config or use default
         port = self.config.get('http_port', 8080)
@@ -431,25 +546,87 @@ class CaptureService:
         
         try:
             while self.running:
-                ret, frame = self.cap.read()
+                # Thread-safe frame reading with error handling
+                try:
+                    with self.cap_lock:
+                        if not self.cap or not self.cap.isOpened():
+                            print("Camera not opened, attempting to reconnect...", flush=True)
+                            if not self.open_camera():
+                                print(f"Failed to reconnect, waiting {self.reconnect_delay}s...", flush=True)
+                                time.sleep(self.reconnect_delay)
+                                continue
+                        
+                        ret, frame = self.cap.read()
+                except Exception as e:
+                    # Catch potential segfaults/exceptions from OpenCV
+                    print(f"Exception reading frame: {e}", flush=True)
+                    self.frame_errors += 1
+                    self.consecutive_errors += 1
+                    ret = False
+                    frame = None
+                
                 frame_count += 1
                 self.total_frames += 1
                 
                 if not ret or frame is None:
                     self.frame_errors += 1
+                    self.consecutive_errors += 1
+                    
+                    # Check if we need to reconnect
+                    if self.consecutive_errors >= self.max_consecutive_errors:
+                        print(f"Too many consecutive errors ({self.consecutive_errors}), reconnecting camera...", flush=True)
+                        self.close_camera()
+                        time.sleep(self.reconnect_delay)
+                        if not self.open_camera():
+                            print(f"Reconnection failed, waiting {self.reconnect_delay}s before retry...", flush=True)
+                            time.sleep(self.reconnect_delay)
+                        continue
+                    
                     # Only log occasionally to avoid spam
                     if self.frame_errors % 100 == 0:
-                        print(f"Warning: Failed to read frame (total errors: {self.frame_errors})", flush=True)
+                        print(f"Warning: Failed to read frame (total errors: {self.frame_errors}, consecutive: {self.consecutive_errors})", flush=True)
                     time.sleep(0.1)
                     continue
                 
                 # Validate frame quality
                 if not self.is_valid_frame(frame):
                     self.corrupted_frames += 1
+                    self.consecutive_errors += 1
+                    
+                    # Debug: Log frame stats for first few corrupted frames
+                    if self.corrupted_frames <= 5:
+                        std_dev = frame.std() if frame is not None else 0
+                        height, width = frame.shape[:2] if frame is not None else (0, 0)
+                        print(f"Debug: Corrupted frame stats - std_dev: {std_dev:.4f}, size: {width}x{height}, shape: {frame.shape if frame is not None else None}", flush=True)
+                    
+                    # Check if we need to reconnect due to too many corrupted frames
+                    if self.consecutive_errors >= self.max_consecutive_errors:
+                        print(f"Too many consecutive corrupted frames ({self.consecutive_errors}), reconnecting camera...", flush=True)
+                        self.close_camera()
+                        time.sleep(self.reconnect_delay)
+                        if not self.open_camera():
+                            print(f"Reconnection failed, waiting {self.reconnect_delay}s before retry...", flush=True)
+                            time.sleep(self.reconnect_delay)
+                        continue
+                    
                     # Only log occasionally
                     if self.corrupted_frames % 100 == 0:
-                        print(f"Warning: Skipped corrupted frame (total corrupted: {self.corrupted_frames})", flush=True)
+                        print(f"Warning: Skipped corrupted frame (total corrupted: {self.corrupted_frames}, consecutive: {self.consecutive_errors})", flush=True)
                     continue
+                
+                # Reset consecutive error counter on valid frame
+                self.consecutive_errors = 0
+                
+                # Measure and update brightness for low light detection
+                brightness = self.measure_brightness(frame)
+                with self.brightness_lock:
+                    self.current_brightness = brightness
+                    # Consider low light if brightness is below 0.2 (20% of max, ~51 on 0-255 scale)
+                    self.is_low_light = brightness < 0.2
+                
+                # Store last good frame for HTTP endpoint
+                with self.last_frame_lock:
+                    self.last_good_frame = frame.copy()
                 
                 # Print status every 10 seconds
                 current_time = time.time()
@@ -468,6 +645,10 @@ class CaptureService:
                     # Apply frames to MOG2 but don't detect motion yet
                     blurred = cv2.GaussianBlur(frame, (21, 21), 0)
                     self.bg_subtractor.apply(blurred)  # Feed to MOG2 for learning
+                    # Store first valid frame for HTTP endpoint
+                    if frame_count == 0:
+                        with self.last_frame_lock:
+                            self.last_good_frame = frame.copy()
                     if frame_count == warmup_frames - 1:
                         print(f"✓ Background model warmed up after {warmup_frames} frames", flush=True)
                     motion_detected = False
@@ -536,8 +717,7 @@ class CaptureService:
             import traceback
             traceback.print_exc()
         finally:
-            if self.cap:
-                self.cap.release()
+            self.close_camera()
             print("Capture service stopped", flush=True)
 
 def load_config():

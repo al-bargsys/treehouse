@@ -121,6 +121,7 @@ services:
       - POSTGRES_USER=birdmonitor
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme265}
       - ZIP_CODE=${ZIP_CODE:-34232}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     networks:
       - bird-monitor-network
     depends_on:
