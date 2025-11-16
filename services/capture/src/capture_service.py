@@ -4,16 +4,24 @@ Capture service for bird monitoring system.
 Captures frames from webcam (via RTSP stream or direct device) and publishes to Redis.
 """
 import cv2
+import numpy as np
 import os
 import sys
 import time
 import json
+import urllib.request
+import urllib.error
 import redis
 import warnings
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from flask import Flask, Response
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 # Suppress OpenCV/h264 decoder warnings
 # These are common with RTSP streams and usually don't affect functionality
 # FFmpeg handles these errors gracefully and continues decoding
@@ -106,6 +114,9 @@ class CaptureService:
         self.current_brightness = 0.0
         self.is_low_light = False
         self.brightness_lock = threading.Lock()
+        # Motion detection diagnostics
+        self.last_motion_area = 0
+        self.last_motion_min_area = 10000
         # Error tracking metrics
         self.frame_errors = 0
         self.corrupted_frames = 0
@@ -182,9 +193,10 @@ class CaptureService:
                 # Use TCP transport for more reliable streaming (latency not critical)
                 # Note: These options may not all be available depending on OpenCV build
                 try:
-                    # Buffer size: Increased for stability (latency not critical)
-                    # Larger buffer helps prevent decoder errors from frame drops
-                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)  # Larger buffer for stability
+                    # Buffer size: Minimize buffer to reduce frame lag and artifacts
+                    # Smaller buffer = fresher frames, less ghosting from buffered frames
+                    # For still image capture, we want the latest frame, not buffered ones
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer for freshest frames
                 except:
                     pass  # Some backends don't support this property
             else:
@@ -279,10 +291,50 @@ class CaptureService:
         
         motion_detected = motion_area > min_area
         
-        # Debug output - only log occasionally to avoid spam
-        # Motion detection logging is handled at capture time, not here
+        # Store motion area for diagnostics
+        self.last_motion_area = motion_area
+        self.last_motion_min_area = min_area
         
         return motion_detected, frame
+    
+    def generate_thumbnail(self, image_path, frame):
+        """Generate a thumbnail for an image."""
+        if not PIL_AVAILABLE:
+            return None
+        
+        if not self.config.get('thumbnail_enabled', True):
+            return None
+        
+        if not self.config.get('thumbnail_generate_on_capture', True):
+            return None
+        
+        try:
+            images_path = Path(self.config.get('images_path', 'data/images'))
+            full_path = images_path / image_path
+            
+            # Get thumbnail dimensions
+            width = self.config.get('thumbnail_width', 300)
+            height = self.config.get('thumbnail_height', 300)
+            quality = self.config.get('thumbnail_quality', 85)
+            
+            # Create thumbnail directory
+            thumbnail_dir = full_path.parent / 'thumbnails'
+            thumbnail_dir.mkdir(parents=True, exist_ok=True)
+            thumbnail_path = thumbnail_dir / full_path.name
+            
+            # Convert OpenCV BGR to RGB for PIL
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+            
+            # Create thumbnail maintaining aspect ratio
+            pil_image.thumbnail((width, height), Image.Resampling.LANCZOS)
+            
+            # Save thumbnail
+            pil_image.save(thumbnail_path, 'JPEG', quality=quality, optimize=True)
+            return str(thumbnail_path.relative_to(images_path))
+        except Exception as e:
+            print(f"Error generating thumbnail: {e}", flush=True)
+            return None
     
     def save_image(self, frame, timestamp):
         """Save image to disk with high quality JPEG encoding."""
@@ -296,7 +348,46 @@ class CaptureService:
         # Use high quality JPEG (95/100) for still images - quality over file size
         jpeg_quality = self.config.get('jpeg_quality', 95)
         cv2.imwrite(str(filepath), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
-        return str(filepath.relative_to(images_path))
+        
+        image_path = str(filepath.relative_to(images_path))
+        
+        # Generate thumbnail if enabled
+        self.generate_thumbnail(image_path, frame)
+        
+        return image_path
+    
+    def save_jpeg_bytes(self, jpeg_bytes, timestamp):
+        """Save raw JPEG bytes to disk using same naming and thumbnail generation."""
+        images_path = Path(self.config.get('images_path', 'data/images'))
+        date_path = images_path / timestamp.strftime('%Y-%m') / timestamp.strftime('%d')
+        date_path.mkdir(parents=True, exist_ok=True)
+        filename = f"{timestamp.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
+        filepath = date_path / filename
+        with open(filepath, 'wb') as f:
+            f.write(jpeg_bytes)
+        image_path = str(filepath.relative_to(images_path))
+        # Generate thumbnail if enabled (load bytes into OpenCV)
+        try:
+            np_arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)  # type: ignore
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                self.generate_thumbnail(image_path, frame)
+        except Exception:
+            pass
+        return image_path
+    
+    def fetch_snapshot_bytes(self, timeout=5.0):
+        """Fetch on-demand snapshot from external snapshot URL if configured."""
+        snapshot_url = self.config.get('snapshot_url')
+        if not snapshot_url:
+            return None
+        try:
+            with urllib.request.urlopen(snapshot_url, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return resp.read()
+        except Exception as e:
+            print(f"Snapshot fetch failed: {e}", flush=True)
+        return None
     
     def measure_sharpness(self, frame):
         """Measure frame sharpness using Laplacian variance (higher = sharper)."""
@@ -341,10 +432,19 @@ class CaptureService:
             if not self.cap or not self.cap.isOpened():
                 return None
             
+            # Don't try to read if camera isn't ready - return immediately
+            try:
+                if not self.cap.isOpened():
+                    return None
+            except:
+                return None
+            
             try:
                 if skip_buffered:
-                    # Read a few frames to get a fresh one (skip buffered frames)
-                    for _ in range(3):
+                    # For HTTP streams, flush more aggressively to avoid stale frames
+                    # Read multiple frames to skip buffered ones and get the latest
+                    num_skip = 5  # Skip more frames for HTTP streams to ensure freshness
+                    for _ in range(num_skip):
                         ret, frame = self.cap.read()
                         if not ret or frame is None:
                             return None
@@ -369,6 +469,9 @@ class CaptureService:
         Capture multiple frames and return the sharpest one (thread-safe).
         This helps avoid motion blur by selecting the frame with least blur.
         
+        For H.264 streams, we flush the buffer more aggressively to avoid
+        inter-frame compression artifacts (ghosting from B-frames).
+        
         Args:
             num_samples: Number of frames to sample
             sample_interval: Time in seconds between samples
@@ -384,6 +487,13 @@ class CaptureService:
             best_sharpness = 0.0
             
             try:
+                # Flush frame buffer aggressively to avoid H.264 inter-frame artifacts
+                # Skip more frames to ensure we're getting fresh, independent frames
+                # This is especially important for H.264 streams with B-frames
+                buffer_flush_count = self.config.get('capture_buffer_flush', 10)
+                for _ in range(buffer_flush_count):
+                    self.cap.read()  # Discard buffered frames
+                
                 # Sample multiple frames and pick the sharpest
                 for i in range(num_samples):
                     ret, frame = self.cap.read()
@@ -408,7 +518,7 @@ class CaptureService:
         # Metadata should already have timestamp as string, but handle both cases
         message = {
             'image_path': image_path,
-            'timestamp': metadata.get('timestamp', datetime.now().isoformat()),
+            'timestamp': metadata.get('timestamp', datetime.now(timezone.utc).isoformat()),
             'motion_score': metadata.get('motion_score', 0),
             'source': metadata.get('source', 'unknown')
         }
@@ -429,23 +539,29 @@ class CaptureService:
         @app.route('/capture/live', methods=['GET'])
         def get_live_frame():
             """Capture and return a live frame as JPEG."""
-            # Try to get a fresh frame (fast mode - single read, no buffering)
-            frame = self.capture_frame(skip_buffered=False)
-            
-            # If capture fails, try to use last good frame
-            if frame is None:
-                with self.last_frame_lock:
-                    if self.last_good_frame is not None:
-                        frame = self.last_good_frame
-                    else:
-                        return Response(
-                            "No frame available",
-                            status=503,
-                            mimetype='text/plain'
-                        )
-            
-            # Encode frame as JPEG
             try:
+                # For live view, use the last good frame (fast, no blocking)
+                # Don't try to read from camera here - it can block if camera is disconnected
+                frame = None
+                
+                # Get the last good frame (fast, no blocking)
+                try:
+                    with self.last_frame_lock:
+                        if self.last_good_frame is not None:
+                            frame = self.last_good_frame.copy()
+                except Exception as e:
+                    print(f"Error accessing last_good_frame: {e}", flush=True)
+                    frame = None
+                
+                # If no cached frame, return error immediately (don't try to read from camera)
+                if frame is None:
+                    return Response(
+                        "No frame available - camera not connected or no frames captured yet",
+                        status=503,
+                        mimetype='text/plain'
+                    )
+                
+                # Encode frame as JPEG
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if not ret:
                     return Response(
@@ -470,6 +586,22 @@ class CaptureService:
                     mimetype='text/plain'
                 )
         
+        @app.route('/capture/snapshot', methods=['GET'])
+        def get_snapshot():
+            """Return a high-quality snapshot from external snapshot source if configured."""
+            jpeg_bytes = self.fetch_snapshot_bytes()
+            if jpeg_bytes:
+                return Response(
+                    jpeg_bytes,
+                    mimetype='image/jpeg',
+                    headers={
+                        'Cache-Control': 'no-cache, no-store, must-revalidate',
+                        'Pragma': 'no-cache',
+                        'Expires': '0'
+                    }
+                )
+            return Response("Snapshot unavailable", status=503, mimetype='text/plain')
+        
         @app.route('/capture/health', methods=['GET'])
         def health():
             """Health check endpoint."""
@@ -487,7 +619,7 @@ class CaptureService:
         
         @app.route('/capture/status', methods=['GET'])
         def status():
-            """Get capture service status including low light detection."""
+            """Get capture service status including low light detection and motion diagnostics."""
             with self.brightness_lock:
                 with self.cap_lock:
                     camera_connected = self.cap is not None and self.cap.isOpened()
@@ -498,7 +630,10 @@ class CaptureService:
                     'brightness': round(self.current_brightness, 3),
                     'frame_errors': int(self.frame_errors),
                     'corrupted_frames': int(self.corrupted_frames),
-                    'total_frames': int(self.total_frames)
+                    'total_frames': int(self.total_frames),
+                    'motion_area': int(self.last_motion_area),
+                    'motion_min_area': int(self.last_motion_min_area),
+                    'motion_detected': bool(self.last_motion_area > self.last_motion_min_area)
                 }, 200
         
         # Get port from config or use default
@@ -506,7 +641,9 @@ class CaptureService:
         host = self.config.get('http_host', '0.0.0.0')
         
         print(f"Starting HTTP server on {host}:{port} for live capture", flush=True)
-        app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+        # Use threaded=True to handle multiple requests concurrently
+        # Use processes=1 to avoid forking issues in Docker
+        app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True, processes=1)
     
     def run(self):
         """Main capture loop."""
@@ -514,14 +651,20 @@ class CaptureService:
             print("Failed to connect to Redis, exiting", flush=True)
             return False
         
-        if not self.open_camera():
-            print("Failed to open camera, exiting", flush=True)
-            return False
-        
-        # Start HTTP server in a separate thread
+        # Start HTTP server in a separate thread BEFORE opening camera
+        # This allows the live view to work even if camera connection is slow/fails
         http_thread = threading.Thread(target=self.start_http_server, daemon=True)
         http_thread.start()
         print("HTTP server thread started", flush=True)
+        
+        # Give HTTP server a moment to start
+        time.sleep(2)
+        
+        # Try to open camera, but continue even if it fails
+        # HTTP server can still serve cached frames
+        camera_opened = self.open_camera()
+        if not camera_opened:
+            print("Warning: Failed to open camera initially, but continuing (will retry in background, HTTP server available)", flush=True)
         
         self.running = True
         background = None
@@ -633,7 +776,12 @@ class CaptureService:
                 if current_time - last_status_time >= 10:
                     time_since_capture = int(current_time - last_capture_time) if last_capture_time > 0 else 0
                     error_rate = (self.frame_errors + self.corrupted_frames) / max(self.total_frames, 1) * 100
-                    print(f"Status: Processing frames... ({frame_count} frames, {motion_detections} motion events, {time_since_capture}s since last capture, {error_rate:.1f}% error rate)", flush=True)
+                    warmup_status = f" (warmup: {warmup_frames - frame_count} frames left)" if frame_count < warmup_frames else ""
+                    print(f"Status: Processing frames... ({frame_count} frames, {motion_detections} motion events, {time_since_capture}s since last capture, {error_rate:.1f}% error rate){warmup_status}", flush=True)
+                    if frame_count >= warmup_frames:
+                        # motion_detected might not be in scope here, so check motion area directly
+                        is_detected = self.last_motion_area > self.last_motion_min_area
+                        print(f"  Motion detection: area={self.last_motion_area}, threshold={self.last_motion_min_area}, detected={is_detected}", flush=True)
                     last_status_time = current_time
                 
                 # Initialize background tracking (MOG2 handles this internally, but we track for status)
@@ -658,6 +806,10 @@ class CaptureService:
                     
                     # Detect motion (MOG2 handles background adaptation automatically)
                     motion_detected, _ = self.detect_motion(frame, background)
+                    
+                    # Log motion detection details occasionally for debugging
+                    if self.config.get('motion_debug', False) and frame_count % 30 == 0:  # Every 30 frames (~2 seconds at 15fps)
+                        print(f"Motion debug: area={self.last_motion_area}, min_area={self.last_motion_min_area}, detected={motion_detected}", flush=True)
                 
                 # Track when motion is first detected
                 if motion_detected:
@@ -682,18 +834,23 @@ class CaptureService:
                     # Wait a bit more for motion to settle, then capture the sharpest frame
                     time.sleep(0.3)  # Additional brief wait for motion to settle
                     
-                    # Capture multiple frames and pick the sharpest one
-                    best_frame = self.capture_best_frame(
-                        num_samples=capture_samples,
-                        sample_interval=capture_sample_interval
-                    )
+                    timestamp = datetime.now(timezone.utc)
+                    image_path = None
                     
-                    if best_frame is None:
-                        print(f"Warning: Failed to capture best frame, using current frame", flush=True)
-                        best_frame = frame
-                    
-                    timestamp = datetime.now()
-                    image_path = self.save_image(best_frame, timestamp)
+                    # Prefer high-quality on-demand snapshot if configured
+                    jpeg_bytes = self.fetch_snapshot_bytes()
+                    if jpeg_bytes:
+                        image_path = self.save_jpeg_bytes(jpeg_bytes, timestamp)
+                    else:
+                        # Fallback: sample frames from the preview stream
+                        best_frame = self.capture_best_frame(
+                            num_samples=capture_samples,
+                            sample_interval=capture_sample_interval
+                        )
+                        if best_frame is None:
+                            print(f"Warning: Failed to capture best frame, using current frame", flush=True)
+                            best_frame = frame
+                        image_path = self.save_image(best_frame, timestamp)
                     
                     metadata = {
                         'timestamp': timestamp.isoformat(),  # Convert to string for JSON serialization
@@ -737,11 +894,20 @@ def load_config():
         'motion_delay': float(os.getenv('MOTION_DELAY', 1.5)),  # Delay after motion detected before capturing (default: 1.5s for sharper images)
         'capture_samples': int(os.getenv('CAPTURE_SAMPLES', 5)),  # Number of frames to sample when capturing (default: 5)
         'capture_sample_interval': float(os.getenv('CAPTURE_SAMPLE_INTERVAL', 0.1)),  # Seconds between samples (default: 0.1s)
+        'capture_buffer_flush': int(os.getenv('CAPTURE_BUFFER_FLUSH', 10)),  # Number of frames to flush before capture (default: 10 to avoid H.264 artifacts)
         'jpeg_quality': int(os.getenv('JPEG_QUALITY', 95)),  # JPEG quality for saved images (1-100, default: 95 for high quality)
         'motion_mog2_var_threshold': float(os.getenv('MOTION_MOG2_VAR_THRESHOLD', 35)),  # MOG2 sensitivity (lower = more sensitive, default: 35)
         'motion_binary_threshold': int(os.getenv('MOTION_BINARY_THRESHOLD', 175)),  # Binary threshold (lower = more sensitive, default: 175)
+        'motion_debug': os.getenv('MOTION_DEBUG', 'false').lower() == 'true',  # Enable motion detection debug logging
         'http_port': int(os.getenv('CAPTURE_HTTP_PORT', 8080)),  # HTTP server port for live capture
         'http_host': os.getenv('CAPTURE_HTTP_HOST', '0.0.0.0'),  # HTTP server host
+        'snapshot_url': os.getenv('SNAPSHOT_URL', None),  # Optional: on-demand snapshot endpoint on host
+        # Thumbnail settings
+        'thumbnail_enabled': os.getenv('THUMBNAIL_ENABLED', 'true').lower() == 'true',
+        'thumbnail_width': int(os.getenv('THUMBNAIL_WIDTH', '300')),
+        'thumbnail_height': int(os.getenv('THUMBNAIL_HEIGHT', '300')),
+        'thumbnail_quality': int(os.getenv('THUMBNAIL_QUALITY', '85')),
+        'thumbnail_generate_on_capture': os.getenv('THUMBNAIL_GENERATE_ON_CAPTURE', 'true').lower() == 'true',
     }
     return config
 

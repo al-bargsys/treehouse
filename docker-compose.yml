@@ -7,6 +7,8 @@ services:
     container_name: bird-monitor-redis
     volumes:
       - redis-data:/data
+    ports:
+      - "6379:6379"  # Expose Redis port for host capture service
     networks:
       - bird-monitor-network
     restart: unless-stopped
@@ -35,44 +37,8 @@ services:
       timeout: 5s
       retries: 5
 
-  # Capture Service (consumes RTSP stream)
-  capture-service:
-    build:
-      context: ./services/capture
-      dockerfile: Dockerfile
-    container_name: bird-monitor-capture
-    volumes:
-      - ./data/images:/app/data/images
-      - ./config:/app/config
-      - ./logs:/app/logs
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_QUEUE=images
-      # RTSP URL - on macOS Docker, use host.docker.internal
-      # On Linux, use host IP or hostname
-      - CAMERA_URL=${CAMERA_URL:-rtsp://host.docker.internal:8554/webcam}
-      - IMAGES_PATH=/app/data/images
-      - CAMERA_RESOLUTION=1920,1080
-      - CAMERA_FPS=15
-      - MOTION_THRESHOLD=50
-      - MOTION_MIN_AREA=3000
-      - MOTION_COOLDOWN=5.0
-      - MOTION_DELAY=1.5
-      - CAPTURE_SAMPLES=5
-      - CAPTURE_SAMPLE_INTERVAL=0.1
-      - JPEG_QUALITY=95
-      - MOTION_MOG2_VAR_THRESHOLD=35
-      - MOTION_BINARY_THRESHOLD=175
-      - CAPTURE_HTTP_PORT=8080
-      - CAPTURE_HTTP_HOST=0.0.0.0
-    networks:
-      - bird-monitor-network
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    command: ["python", "src/capture_service.py"]
+  # NOTE: Capture service now runs on host (not in Docker) to directly access USB webcam
+  # See scripts/start_host_capture.sh for starting the host capture service
 
   # Detection Service (consumes images from Redis, runs YOLOv8 inference)
   detection-service:
@@ -90,8 +56,21 @@ services:
       - REDIS_IMAGES_QUEUE=images
       - REDIS_DETECTIONS_QUEUE=detections
       - IMAGES_PATH=/app/data/images
-      - MODEL_PATH=${MODEL_PATH:-yolov8n.pt}
-      - CONFIDENCE_THRESHOLD=${CONFIDENCE_THRESHOLD:-0.4}
+      #- MODEL_PATH=${MODEL_PATH:-yolov8n.pt}
+      - MODEL_PATH=/app/models/yolov8_person_bird_squirrel/20251113_085413/weights/best.pt
+      - CONFIDENCE_THRESHOLD=0.25
+      # Per-class confidence thresholds
+      - HUMAN_CONFIDENCE_THRESHOLD=0.5
+      - BIRD_CONFIDENCE_THRESHOLD=0.50
+      - SQUIRREL_CONFIDENCE_THRESHOLD=0.1
+      - DETECTION_DEBUG=true
+      - DETECTION_DEBUG_SAVE=true
+      # Class IDs for custom trained model (person=0, bird=1, squirrel=2)
+      # If not set, will auto-detect from model class names
+      - HUMAN_CLASS_ID=0
+      - BIRD_CLASS_ID=1
+      - SQUIRREL_CLASS_ID=2
+      #- SQUIRREL_CLASS_ID=${SQUIRREL_CLASS_ID:--1}
     networks:
       - bird-monitor-network
     depends_on:
@@ -110,6 +89,7 @@ services:
       - ./data/images:/app/data/images
       - ./config:/app/config
       - ./shared:/app/shared
+      - ./scripts:/app/scripts
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -122,6 +102,19 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme265}
       - ZIP_CODE=${ZIP_CODE:-34232}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Image management settings
+      - IMAGE_RETENTION_DAYS=${IMAGE_RETENTION_DAYS:-90}
+      - IMAGE_CLEANUP_ENABLED=${IMAGE_CLEANUP_ENABLED:-false}
+      - IMAGE_CLEANUP_SCHEDULE=${IMAGE_CLEANUP_SCHEDULE:-0 2 * * *}
+      - IMAGE_CLEANUP_KEEP_DETECTED=${IMAGE_CLEANUP_KEEP_DETECTED:-true}
+      - IMAGE_CLEANUP_DETECTED_RETENTION_DAYS=${IMAGE_CLEANUP_DETECTED_RETENTION_DAYS:-365}
+      - IMAGE_COMPRESSION_ENABLED=${IMAGE_COMPRESSION_ENABLED:-false}
+      - IMAGE_COMPRESSION_QUALITY=${IMAGE_COMPRESSION_QUALITY:-85}
+      - IMAGE_COMPRESSION_PRESERVE_ORIGINAL=${IMAGE_COMPRESSION_PRESERVE_ORIGINAL:-false}
+      - THUMBNAIL_ENABLED=${THUMBNAIL_ENABLED:-true}
+      - THUMBNAIL_WIDTH=${THUMBNAIL_WIDTH:-300}
+      - THUMBNAIL_HEIGHT=${THUMBNAIL_HEIGHT:-300}
+      - THUMBNAIL_QUALITY=${THUMBNAIL_QUALITY:-85}
     networks:
       - bird-monitor-network
     depends_on:
@@ -169,6 +162,8 @@ services:
       - ./config:/app/config
       - ./services/api/static:/app/static
       - ./shared:/app/shared
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -178,6 +173,7 @@ services:
       - IMAGES_PATH=/app/data/images
       - STATIC_PATH=/app/static
       - ZIP_CODE=${ZIP_CODE:-34232}
+      - CAPTURE_SERVICE_URL=${CAPTURE_SERVICE_URL:-http://host.docker.internal:8080}
     ports:
       - "8000:8000"
     networks:
@@ -209,18 +205,20 @@ networks:
   bird-monitor-network:
     driver: bridge
 
-# Note: RTSP streaming setup
+# Architecture:
 # 
-# On macOS:
-# 1. Install MediaMTX: brew install mediamtx
-# 2. Start RTSP server: ./scripts/start_rtsp_server.sh
-# 3. Stream webcam: ./scripts/stream_webcam_to_rtsp.sh
-# 4. Start Docker services: docker-compose up
+# Host (macOS/Linux):
+#   - Host capture service (runs directly on host to access USB webcam)
+#   - Connects to Redis in Docker via localhost:6379
+#   - Serves HTTP endpoints on port 8080 for live view
 #
-# On Linux:
-# 1. Install MediaMTX or use FFmpeg's RTSP server
-# 2. Stream webcam to RTSP
-# 3. Update CAMERA_URL in .env to use host IP instead of host.docker.internal
+# Docker:
+#   - Redis (exposed on port 6379 for host access)
+#   - Detection service (consumes images from Redis)
+#   - Storage service (consumes detections from Redis)
+#   - API service (connects to host capture service via host.docker.internal:8080)
 #
-# The capture-service will automatically connect to the RTSP stream.
+# To start:
+#   1. Start Docker services: docker-compose up -d
+#   2. Start host capture service: ./scripts/start_host_capture.sh
 

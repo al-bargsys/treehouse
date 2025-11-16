@@ -24,6 +24,8 @@ echo "  HTTP Port: ${HTTP_PORT}"
 echo ""
 echo "Streams will be available at:"
 echo "  rtsp://localhost:${RTSP_PORT}/webcam"
+echo "  rtsp://localhost:${RTSP_PORT}/webcam-live"
+echo "  rtsp://localhost:${RTSP_PORT}/webcam-hi"
 echo ""
 echo "Press Ctrl+C to stop"
 echo ""
@@ -40,6 +42,10 @@ logDestinations: [stdout]
 logFile: ""
 paths:
   webcam:
+    source: publisher
+  webcam-live:
+    source: publisher
+  webcam-hi:
     source: publisher
 EOF
     echo "Created MediaMTX config at: $CONFIG_FILE"
@@ -60,6 +66,14 @@ else
     if ! grep -q "source: publisher" "$CONFIG_FILE"; then
         # Add source if path exists but source is missing
         sed -i.bak '/^  webcam:/a\    source: publisher' "$CONFIG_FILE"
+    fi
+    # Ensure webcam-live path exists
+    if ! grep -q "^  webcam-live:" "$CONFIG_FILE"; then
+        printf "\n  webcam-live:\n    source: publisher\n" >> "$CONFIG_FILE"
+    fi
+    # Ensure webcam-hi path exists
+    if ! grep -q "^  webcam-hi:" "$CONFIG_FILE"; then
+        printf "\n  webcam-hi:\n    source: publisher\n" >> "$CONFIG_FILE"
     fi
     echo "Config file updated"
 fi

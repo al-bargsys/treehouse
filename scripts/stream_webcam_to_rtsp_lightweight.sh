@@ -70,7 +70,7 @@ ffmpeg -hide_banner -loglevel warning \
     -preset veryfast \
     -tune zerolatency \
     -profile:v high \
-    -level 4.0 \
+    -level 4.2 \
     -pix_fmt yuv420p \
     -b:v 4M \
     -maxrate 5M \

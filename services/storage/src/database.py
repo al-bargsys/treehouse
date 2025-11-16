@@ -62,6 +62,7 @@ class Database:
                         image_path TEXT NOT NULL,
                         is_bird BOOLEAN NOT NULL,
                         is_human BOOLEAN NOT NULL DEFAULT FALSE,
+                        is_squirrel BOOLEAN NOT NULL DEFAULT FALSE,
                         category TEXT,
                         confidence REAL,
                         species TEXT,
@@ -82,6 +83,10 @@ class Database:
                             ALTER TABLE detections ADD COLUMN is_human BOOLEAN NOT NULL DEFAULT FALSE;
                         END IF;
                         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                      WHERE table_name='detections' AND column_name='is_squirrel') THEN
+                            ALTER TABLE detections ADD COLUMN is_squirrel BOOLEAN NOT NULL DEFAULT FALSE;
+                        END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                                       WHERE table_name='detections' AND column_name='category') THEN
                             ALTER TABLE detections ADD COLUMN category TEXT;
                         END IF;
@@ -96,6 +101,14 @@ class Database:
                         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                                       WHERE table_name='detections' AND column_name='bird_backstory') THEN
                             ALTER TABLE detections ADD COLUMN bird_backstory TEXT;
+                        END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                      WHERE table_name='detections' AND column_name='bbox_image_path') THEN
+                            ALTER TABLE detections ADD COLUMN bbox_image_path TEXT;
+                        END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                      WHERE table_name='detections' AND column_name='video_path') THEN
+                            ALTER TABLE detections ADD COLUMN video_path TEXT;
                         END IF;
                     END $$;
                 """)
@@ -117,6 +130,11 @@ class Database:
                 """)
                 
                 cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_detections_is_squirrel 
+                    ON detections(is_squirrel);
+                """)
+                
+                cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_detections_category 
                     ON detections(category);
                 """)
@@ -124,6 +142,37 @@ class Database:
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_detections_created_at 
                     ON detections(created_at);
+                """)
+                
+                # Create detection_annotations table for human feedback
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS detection_annotations (
+                        id SERIAL PRIMARY KEY,
+                        detection_id INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
+                        is_correct BOOLEAN NOT NULL,
+                        correct_class TEXT,
+                        incorrect_class TEXT,
+                        notes TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(detection_id)
+                    );
+                """)
+                
+                # Create indexes for annotations
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_annotations_detection_id 
+                    ON detection_annotations(detection_id);
+                """)
+                
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_annotations_is_correct 
+                    ON detection_annotations(is_correct);
+                """)
+                
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_annotations_created_at 
+                    ON detection_annotations(created_at);
                 """)
                 
                 conn.commit()
@@ -147,12 +196,12 @@ class Database:
                 import json
                 cur.execute("""
                     INSERT INTO detections (
-                        timestamp, image_path, is_bird, is_human, category, confidence, species,
+                        timestamp, image_path, is_bird, is_human, is_squirrel, category, confidence, species,
                         bounding_boxes, motion_score, metadata, detected_at, weather,
-                        bird_name, bird_backstory
+                        bird_name, bird_backstory, bbox_image_path, video_path
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s::jsonb,
-                        %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s::jsonb,
+                        %s, %s, %s, %s
                     )
                     RETURNING id;
                 """, (
@@ -160,6 +209,7 @@ class Database:
                     detection_data['image_path'],
                     detection_data.get('is_bird', False),
                     detection_data.get('is_human', False),
+                    detection_data.get('is_squirrel', False),
                     detection_data.get('category'),
                     detection_data.get('confidence'),
                     detection_data.get('species'),
@@ -169,7 +219,9 @@ class Database:
                     detection_data.get('detected_at'),
                     json.dumps(detection_data.get('weather')) if detection_data.get('weather') else None,
                     detection_data.get('bird_name'),
-                    detection_data.get('bird_backstory')
+                    detection_data.get('bird_backstory'),
+                    detection_data.get('bbox_image_path'),
+                    detection_data.get('video_path')
                 ))
                 
                 detection_id = cur.fetchone()[0]
@@ -180,6 +232,130 @@ class Database:
             conn.rollback()
             logger.error(f"Error inserting detection: {e}")
             return None
+        finally:
+            self.return_connection(conn)
+    
+    def delete_detections_bulk(self, detection_ids: list) -> int:
+        """Delete multiple detections by IDs. Returns number of deleted rows."""
+        if not detection_ids:
+            return 0
+        
+        conn = self.get_connection()
+        if not conn:
+            return 0
+        
+        try:
+            with conn.cursor() as cur:
+                # Use parameterized query with tuple for IN clause
+                placeholders = ','.join(['%s'] * len(detection_ids))
+                cur.execute(
+                    f"DELETE FROM detections WHERE id IN ({placeholders})",
+                    tuple(detection_ids)
+                )
+                deleted_count = cur.rowcount
+                conn.commit()
+                logger.info(f"Bulk deleted {deleted_count} detections")
+                return deleted_count
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error bulk deleting detections: {e}")
+            return 0
+        finally:
+            self.return_connection(conn)
+    
+    def get_detection_image_paths(self, detection_ids: list) -> list:
+        """Get image paths for given detection IDs."""
+        if not detection_ids:
+            return []
+        
+        conn = self.get_connection()
+        if not conn:
+            return []
+        
+        try:
+            with conn.cursor() as cur:
+                placeholders = ','.join(['%s'] * len(detection_ids))
+                cur.execute(
+                    f"SELECT image_path FROM detections WHERE id IN ({placeholders})",
+                    tuple(detection_ids)
+                )
+                rows = cur.fetchall()
+                return [row[0] for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting image paths: {e}")
+            return []
+        finally:
+            self.return_connection(conn)
+    
+    def delete_detections_by_filter(
+        self,
+        category: str = None,
+        start_date = None,
+        end_date = None,
+        is_bird: bool = None,
+        is_human: bool = None
+    ) -> tuple[int, list]:
+        """
+        Delete detections by filter criteria.
+        Returns tuple of (deleted_count, image_paths)
+        """
+        conn = self.get_connection()
+        if not conn:
+            return 0, []
+        
+        try:
+            with conn.cursor() as cur:
+                # Build WHERE clause
+                conditions = []
+                params = []
+                
+                if category:
+                    conditions.append("category = %s")
+                    params.append(category)
+                
+                if start_date:
+                    conditions.append("timestamp >= %s")
+                    params.append(start_date)
+                
+                if end_date:
+                    conditions.append("timestamp <= %s")
+                    params.append(end_date)
+                
+                if is_bird is not None:
+                    conditions.append("is_bird = %s")
+                    params.append(is_bird)
+                
+                if is_human is not None:
+                    conditions.append("is_human = %s")
+                    params.append(is_human)
+                
+                if not conditions:
+                    # Don't delete all if no conditions
+                    logger.warning("No filter conditions provided for bulk delete")
+                    return 0, []
+                
+                where_clause = " AND ".join(conditions)
+                
+                # Get image paths first
+                cur.execute(
+                    f"SELECT image_path FROM detections WHERE {where_clause}",
+                    params
+                )
+                image_paths = [row[0] for row in cur.fetchall()]
+                
+                # Delete detections
+                cur.execute(
+                    f"DELETE FROM detections WHERE {where_clause}",
+                    params
+                )
+                deleted_count = cur.rowcount
+                conn.commit()
+                logger.info(f"Bulk deleted {deleted_count} detections by filter")
+                return deleted_count, image_paths
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error bulk deleting by filter: {e}")
+            return 0, []
         finally:
             self.return_connection(conn)
     
